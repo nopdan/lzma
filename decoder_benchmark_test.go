@@ -2,137 +2,142 @@ package lzma
 
 import (
 	"bytes"
-	"encoding/binary"
 	"io"
+	"os"
 	"testing"
 
+	itchiolzma "github.com/itchio/lzma"
 	reflzma "github.com/ulikunitz/xz/lzma"
 )
 
-func benchmarkPayload() []byte {
-	return bytes.Repeat([]byte("The quick brown fox jumps over the lazy dog. abcabcXYZ1234567890\n"), 1024)
+const benchmarkFilePath = "333_53119_SRJ.lzma"
+
+// const benchmarkFilePath = "silesia.tar.lzma"
+
+func loadBenchmarkCompressedFile(b testing.TB) []byte {
+	b.Helper()
+	data, err := os.ReadFile(benchmarkFilePath)
+	if err != nil {
+		b.Fatalf("read benchmark file failed: %v", err)
+	}
+	return data
 }
 
-func BenchmarkDecompressKnownSize(b *testing.B) {
-	src := benchmarkPayload()
-	compressed := compressWithReferenceLZMA(b, src)
-	if len(compressed) < LZMAHeaderSize+5 {
-		b.Fatalf("compressed stream too short: %d", len(compressed))
+func detectDecodedSize(b testing.TB, compressed []byte) int64 {
+	b.Helper()
+	r, err := reflzma.NewReader(bytes.NewReader(compressed))
+	if err != nil {
+		b.Fatalf("ulikunitz NewReader for size probe failed: %v", err)
 	}
-	binary.LittleEndian.PutUint64(compressed[5:13], uint64(len(src)))
+	n, err := io.Copy(io.Discard, r)
+	if err != nil {
+		b.Fatalf("ulikunitz decode size probe failed: %v", err)
+	}
+	return n
+}
 
-	b.SetBytes(int64(len(src)))
+func benchmarkDecodeInMemory(b *testing.B, compressed []byte, decodedSize int64, open func(io.Reader) (io.ReadCloser, error)) {
+	b.Helper()
+	b.SetBytes(decodedSize)
 	b.ReportAllocs()
 	b.ResetTimer()
 
+	var src bytes.Reader
 	for i := 0; i < b.N; i++ {
-		out, err := Decompress(compressed)
+		src.Reset(compressed)
+		r, err := open(&src)
 		if err != nil {
-			b.Fatalf("Decompress failed: %v", err)
+			b.Fatalf("open reader failed: %v", err)
 		}
-		if len(out) != len(src) {
-			b.Fatalf("output size mismatch: got %d want %d", len(out), len(src))
-		}
-	}
-}
-
-func BenchmarkDecompressUnknownSize(b *testing.B) {
-	src := benchmarkPayload()
-	compressed := compressWithReferenceLZMA(b, src)
-	if len(compressed) < LZMAHeaderSize+5 {
-		b.Fatalf("compressed stream too short: %d", len(compressed))
-	}
-	binary.LittleEndian.PutUint64(compressed[5:13], ^uint64(0))
-
-	b.SetBytes(int64(len(src)))
-	b.ReportAllocs()
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
-		out, err := Decompress(compressed)
+		_, err = io.Copy(io.Discard, r)
+		_ = r.Close()
 		if err != nil {
-			b.Fatalf("Decompress failed: %v", err)
-		}
-		if len(out) != len(src) {
-			b.Fatalf("output size mismatch: got %d want %d", len(out), len(src))
+			b.Fatalf("decode failed: %v", err)
 		}
 	}
 }
 
-func BenchmarkDecoderStreamKnownSize(b *testing.B) {
-	src := benchmarkPayload()
-	compressed := compressWithReferenceLZMA(b, src)
-	if len(compressed) < LZMAHeaderSize+5 {
-		b.Fatalf("compressed stream too short: %d", len(compressed))
-	}
-	binary.LittleEndian.PutUint64(compressed[5:13], uint64(len(src)))
-
-	b.SetBytes(int64(len(src)))
+func benchmarkDecodeFromFile(b *testing.B, filePath string, decodedSize int64, open func(io.Reader) (io.ReadCloser, error)) {
+	b.Helper()
+	b.SetBytes(decodedSize)
 	b.ReportAllocs()
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		dec := NewDecoder()
-		var out bytes.Buffer
-		if err := dec.DecodeLZMA(bytes.NewReader(compressed), &out); err != nil {
-			b.Fatalf("DecodeLZMA failed: %v", err)
+		f, err := os.Open(filePath)
+		if err != nil {
+			b.Fatalf("open compressed file failed: %v", err)
 		}
-		if out.Len() != len(src) {
-			b.Fatalf("output size mismatch: got %d want %d", out.Len(), len(src))
+
+		r, err := open(f)
+		if err != nil {
+			_ = f.Close()
+			b.Fatalf("open reader failed: %v", err)
+		}
+
+		_, err = io.Copy(io.Discard, r)
+		_ = r.Close()
+		_ = f.Close()
+		if err != nil {
+			b.Fatalf("decode failed: %v", err)
 		}
 	}
 }
 
-func BenchmarkUlikunitzDecodeKnownSize(b *testing.B) {
-	src := benchmarkPayload()
-	compressed := compressWithReferenceLZMA(b, src)
-	if len(compressed) < LZMAHeaderSize+5 {
-		b.Fatalf("compressed stream too short: %d", len(compressed))
+func openOurBenchmark(src io.Reader) (io.ReadCloser, error) {
+	return NewReader(src)
+}
+
+func openUlikunitzBenchmark(src io.Reader) (io.ReadCloser, error) {
+	r, err := reflzma.NewReader(src)
+	if err != nil {
+		return nil, err
 	}
-	binary.LittleEndian.PutUint64(compressed[5:13], uint64(len(src)))
+	return io.NopCloser(r), nil
+}
 
-	b.SetBytes(int64(len(src)))
-	b.ReportAllocs()
-	b.ResetTimer()
+func openItchioBenchmark(src io.Reader) (io.ReadCloser, error) {
+	return itchiolzma.NewReader(src), nil
+}
 
-	for i := 0; i < b.N; i++ {
-		r, err := reflzma.NewReader(bytes.NewReader(compressed))
-		if err != nil {
-			b.Fatalf("ulikunitz NewReader failed: %v", err)
-		}
-		n, err := io.Copy(io.Discard, r)
-		if err != nil {
-			b.Fatalf("ulikunitz decode copy failed: %v", err)
-		}
-		if int(n) != len(src) {
-			b.Fatalf("output size mismatch: got %d want %d", n, len(src))
-		}
+func BenchmarkDecodeImplementationsMemory(b *testing.B) {
+	compressed := loadBenchmarkCompressedFile(b)
+	decodedSize := detectDecodedSize(b, compressed)
+
+	implementations := []struct {
+		name string
+		open func(io.Reader) (io.ReadCloser, error)
+	}{
+		{name: "Our", open: openOurBenchmark},
+		{name: "Ulikunitz", open: openUlikunitzBenchmark},
+		{name: "Itchio", open: openItchioBenchmark},
+	}
+
+	for _, impl := range implementations {
+		impl := impl
+		b.Run(impl.name, func(b *testing.B) {
+			benchmarkDecodeInMemory(b, compressed, decodedSize, impl.open)
+		})
 	}
 }
 
-func BenchmarkUlikunitzDecodeUnknownSize(b *testing.B) {
-	src := benchmarkPayload()
-	compressed := compressWithReferenceLZMA(b, src)
-	if len(compressed) < LZMAHeaderSize+5 {
-		b.Fatalf("compressed stream too short: %d", len(compressed))
+func BenchmarkDecodeImplementationsFile(b *testing.B) {
+	compressed := loadBenchmarkCompressedFile(b)
+	decodedSize := detectDecodedSize(b, compressed)
+
+	implementations := []struct {
+		name string
+		open func(io.Reader) (io.ReadCloser, error)
+	}{
+		{name: "Our", open: openOurBenchmark},
+		{name: "Ulikunitz", open: openUlikunitzBenchmark},
+		{name: "Itchio", open: openItchioBenchmark},
 	}
-	binary.LittleEndian.PutUint64(compressed[5:13], ^uint64(0))
 
-	b.SetBytes(int64(len(src)))
-	b.ReportAllocs()
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
-		r, err := reflzma.NewReader(bytes.NewReader(compressed))
-		if err != nil {
-			b.Fatalf("ulikunitz NewReader failed: %v", err)
-		}
-		n, err := io.Copy(io.Discard, r)
-		if err != nil {
-			b.Fatalf("ulikunitz decode copy failed: %v", err)
-		}
-		if int(n) != len(src) {
-			b.Fatalf("output size mismatch: got %d want %d", n, len(src))
-		}
+	for _, impl := range implementations {
+		impl := impl
+		b.Run(impl.name, func(b *testing.B) {
+			benchmarkDecodeFromFile(b, benchmarkFilePath, decodedSize, impl.open)
+		})
 	}
 }

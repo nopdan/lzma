@@ -3,31 +3,36 @@ package lzma
 import "testing"
 
 func TestStateTransitions(t *testing.T) {
-	if updateStateLiteral(0) != 0 {
-		t.Fatalf("literal from 0 should stay 0")
-	}
-	if updateStateLiteral(4) != 1 {
-		t.Fatalf("literal from 4 should be 1")
-	}
-	if updateStateLiteral(10) != 4 {
-		t.Fatalf("literal from 10 should be 4")
+	tests := []struct {
+		name string
+		got  uint32
+		want uint32
+	}{
+		{name: "literal-0", got: updateStateLiteral(0), want: 0},
+		{name: "literal-4", got: updateStateLiteral(4), want: 1},
+		{name: "literal-10", got: updateStateLiteral(10), want: 4},
+		{name: "match-0", got: updateStateMatch(0), want: 7},
+		{name: "match-8", got: updateStateMatch(8), want: 10},
+		{name: "rep-0", got: updateStateRep(0), want: 8},
+		{name: "rep-8", got: updateStateRep(8), want: 11},
+		{name: "short-rep-0", got: updateStateShortRep(0), want: 9},
+		{name: "short-rep-8", got: updateStateShortRep(8), want: 11},
 	}
 
-	if updateStateMatch(0) != 7 || updateStateMatch(8) != 10 {
-		t.Fatalf("unexpected match transition")
-	}
-	if updateStateRep(0) != 8 || updateStateRep(8) != 11 {
-		t.Fatalf("unexpected rep transition")
-	}
-	if updateStateShortRep(0) != 9 || updateStateShortRep(8) != 11 {
-		t.Fatalf("unexpected short rep transition")
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.got != tt.want {
+				t.Fatalf("%s = %d, want %d", tt.name, tt.got, tt.want)
+			}
+		})
 	}
 }
 
 func TestGetLenToPosState(t *testing.T) {
 	cases := []struct {
 		length uint32
-		want   int
+		want   uint32
 	}{
 		{2, 0},
 		{3, 1},

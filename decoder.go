@@ -7,11 +7,15 @@ import (
 )
 
 var (
-	ErrNotImplemented     = errors.New("lzma decode path is not fully implemented yet")
+	// ErrNotImplemented is reserved for incomplete decode branches.
+	ErrNotImplemented = errors.New("lzma decode path is not fully implemented yet")
+	// ErrDataAfterEndMarker reports data that appears after an end marker in known-size mode.
 	ErrDataAfterEndMarker = errors.New("lzma stream ended by end marker before expected size")
-	ErrOutputOverrun      = errors.New("lzma decoded output exceeds declared uncompressed size")
+	// ErrOutputOverrun reports decoded output that exceeds the declared uncompressed size.
+	ErrOutputOverrun = errors.New("lzma decoded output exceeds declared uncompressed size")
 )
 
+// Core LZMA decoder model constants.
 const (
 	numStates          = 12
 	literalSize        = 0x300
@@ -25,9 +29,9 @@ const (
 	alignTableSize     = 1 << numAlignBits
 	matchMinLen        = 2
 	numPosStatesMax    = 1 << 4
-	outWriteChunkSize   = 32 << 10
 )
 
+// lenDecoder decodes match lengths from low/mid/high trees keyed by posState.
 type lenDecoder struct {
 	choice  uint16
 	choice2 uint16
@@ -36,6 +40,7 @@ type lenDecoder struct {
 	high    [1 << 8]uint16
 }
 
+// init resets all length decoder probabilities.
 func (ld *lenDecoder) init() {
 	ld.choice = probInit
 	ld.choice2 = probInit
@@ -50,21 +55,22 @@ func (ld *lenDecoder) init() {
 	}
 }
 
-func (ld *lenDecoder) decode(rd *RangeDecoder, posState int) (uint32, error) {
-	bit, err := rd.DecodeBit(&ld.choice)
+// decode decodes one length symbol for the given position state.
+func (ld *lenDecoder) decode(rd *rangeDecoder, posState uint32) (uint32, error) {
+	bit, err := rd.decodeBit(&ld.choice)
 	if err != nil {
 		return 0, err
 	}
 	if bit == 0 {
-		return decodeBitTree(rd, ld.low[posState][:], 3)
+		return decodeBitTree(rd, ld.low[int(posState)][:], 3)
 	}
 
-	bit, err = rd.DecodeBit(&ld.choice2)
+	bit, err = rd.decodeBit(&ld.choice2)
 	if err != nil {
 		return 0, err
 	}
 	if bit == 0 {
-		v, err := decodeBitTree(rd, ld.mid[posState][:], 3)
+		v, err := decodeBitTree(rd, ld.mid[int(posState)][:], 3)
 		if err != nil {
 			return 0, err
 		}
@@ -78,78 +84,10 @@ func (ld *lenDecoder) decode(rd *RangeDecoder, posState int) (uint32, error) {
 	return v + 16, nil
 }
 
-type outWindow struct {
-	buf     []byte
-	pos     uint32
-	filled  uint64
-	writer  io.Writer
-	pending []byte
-	pn      int
-	total   uint64
-	bufSize uint32
-}
-
-func newOutWindow(size uint32, writer io.Writer) *outWindow {
-	if size == 0 {
-		size = 1
-	}
-	return &outWindow{
-		buf:     make([]byte, size),
-		writer:  writer,
-		pending: make([]byte, outWriteChunkSize),
-		bufSize: size,
-	}
-}
-
-func (ow *outWindow) putByte(b byte) error {
-	ow.buf[ow.pos] = b
-	ow.pos++
-	if ow.pos == ow.bufSize {
-		ow.pos = 0
-	}
-	ow.total++
-	if ow.filled < uint64(ow.bufSize) {
-		ow.filled++
-	}
-	ow.pending[ow.pn] = b
-	ow.pn++
-	if ow.pn == len(ow.pending) {
-		return ow.flush()
-	}
-	return nil
-}
-
-func (ow *outWindow) getByte(distance uint32) (byte, error) {
-	if uint64(distance) >= ow.filled {
-		return 0, fmt.Errorf("invalid distance %d, only %d bytes available in window", distance, ow.filled)
-	}
-
-	idx := int64(ow.pos) - int64(distance) - 1
-	if idx < 0 {
-		idx += int64(ow.bufSize)
-	}
-	return ow.buf[idx], nil
-}
-
-func (ow *outWindow) flush() error {
-	written := 0
-	for written < ow.pn {
-		n, err := ow.writer.Write(ow.pending[written:ow.pn])
-		written += n
-		if err != nil {
-			return err
-		}
-		if n == 0 {
-			return io.ErrShortWrite
-		}
-	}
-	ow.pn = 0
-	return nil
-}
-
-type Decoder struct {
-	header Header
-	rd     *RangeDecoder
+// decoder holds all probability models and stream state for LZMA decoding.
+type decoder struct {
+	header header
+	rd     *rangeDecoder
 	out    *outWindow
 
 	isMatchProbs []uint16
@@ -167,217 +105,319 @@ type Decoder struct {
 	repLenDecoder lenDecoder
 	literalProbs  []uint16
 
-	state int
-	pos   int64
+	state uint32
+	pos   uint64
 	prev  byte
 
 	rep0 uint32
 	rep1 uint32
 	rep2 uint32
 	rep3 uint32
+
+	hasKnownSize bool
+	knownSize    uint64
+
+	posStateMask     uint32
+	pb               uint32
+	literalLPMask    uint32
+	literalLC        uint32
+	literalPrevShift uint32
+
+	finished        bool
+	pendingMatchLen uint32
 }
 
-func NewDecoder() *Decoder {
-	return &Decoder{}
+// newDecoder allocates an empty decoder instance.
+func newDecoder() *decoder {
+	return &decoder{}
 }
 
-func (d *Decoder) Header() Header {
-	return d.header
-}
-
-func (d *Decoder) DecodeLZMA(r io.Reader, w io.Writer) error {
-	hdr, err := ReadLZMAHeader(r)
-	if err != nil {
-		return err
-	}
+// resetForHeader resets per-stream state from parsed header metadata.
+func (d *decoder) resetForHeader(hdr header) {
 	d.header = hdr
+	d.hasKnownSize = hdr.HasUncompressedSize
+	if d.hasKnownSize {
+		d.knownSize = hdr.UncompressedSize
+	} else {
+		d.knownSize = 0
+	}
+	d.finished = false
+	d.pendingMatchLen = 0
+	d.pos = 0
+	d.prev = 0
+	d.state = 0
+	d.rep0 = 0
+	d.rep1 = 0
+	d.rep2 = 0
+	d.rep3 = 0
+}
 
-	rd, err := NewRangeDecoder(r)
+// read decodes into p using pull mode and returns produced bytes.
+func (d *decoder) read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+
+	if d.finished {
+		return 0, io.EOF
+	}
+
+	written := 0
+
+	if d.pendingMatchLen > 0 {
+		if err := d.emitPendingMatch(p, &written); err != nil {
+			return written, err
+		}
+		if written >= len(p) {
+			return written, nil
+		}
+	}
+
+	for written < len(p) {
+		if d.hasKnownSize && d.pos >= d.knownSize {
+			d.finished = true
+			if written == 0 {
+				return 0, io.EOF
+			}
+			return written, nil
+		}
+
+		if err := d.decodeOne(p, &written); err != nil {
+			if err == io.EOF {
+				d.finished = true
+				if written > 0 {
+					return written, nil
+				}
+			}
+			return written, err
+		}
+
+		if d.pendingMatchLen > 0 && written < len(p) {
+			if err := d.emitPendingMatch(p, &written); err != nil {
+				return written, err
+			}
+		}
+	}
+
+	if written == 0 && d.finished {
+		return 0, io.EOF
+	}
+
+	return written, nil
+}
+
+// decodeOne decodes a single symbol (literal, match, or rep sequence).
+func (d *decoder) decodeOne(dst []byte, written *int) error {
+	if d.hasKnownSize && d.pos >= d.knownSize {
+		d.finished = true
+		return io.EOF
+	}
+
+	posState := d.currentPosState()
+	state := d.state
+	stateIdx := int(state)
+	idx := (state << d.pb) + posState
+	isMatch, err := d.rd.decodeBit(&d.isMatchProbs[int(idx)])
 	if err != nil {
 		return err
 	}
-	d.rd = rd
 
-	if hdr.UncompressedSize == 0 {
+	if isMatch == 0 {
+		b, err := d.decodeLiteral()
+		if err != nil {
+			return err
+		}
+		d.out.putByte(b)
+		dst[*written] = b
+		*written = *written + 1
+		d.state = updateStateLiteral(d.state)
+		d.prev = b
+		d.pos++
 		return nil
 	}
 
-	if err := d.initModels(); err != nil {
+	isRep, err := d.rd.decodeBit(&d.isRepProbs[stateIdx])
+	if err != nil {
 		return err
 	}
-	d.out = newOutWindow(hdr.DictionarySize, w)
 
-	hasKnownSize := hdr.UncompressedSize >= 0
-
-	for {
-		if hasKnownSize && d.pos >= hdr.UncompressedSize {
-			return d.out.flush()
-		}
-
-		posState := d.currentPosState()
-		idx := (d.state << hdr.Properties.PB) + posState
-		isMatch, err := d.rd.DecodeBit(&d.isMatchProbs[idx])
+	var length uint32
+	if isRep == 1 {
+		isRepG0, err := d.rd.decodeBit(&d.isRepG0Probs[stateIdx])
 		if err != nil {
 			return err
 		}
-
-		if isMatch == 0 {
-			b, err := d.decodeLiteral()
+		if isRepG0 == 0 {
+			isRep0LongIdx := (state << d.pb) + posState
+			isRep0Long, err := d.rd.decodeBit(&d.isRep0Long[int(isRep0LongIdx)])
 			if err != nil {
 				return err
 			}
-			if err := d.out.putByte(b); err != nil {
-				return err
-			}
-
-			d.state = updateStateLiteral(d.state)
-			d.prev = b
-			d.pos++
-			continue
-		}
-
-		isRep, err := d.rd.DecodeBit(&d.isRepProbs[d.state])
-		if err != nil {
-			return err
-		}
-
-		var length uint32
-		if isRep == 1 {
-			isRepG0, err := d.rd.DecodeBit(&d.isRepG0Probs[d.state])
-			if err != nil {
-				return err
-			}
-			if isRepG0 == 0 {
-				isRep0LongIdx := (d.state << d.header.Properties.PB) + posState
-				isRep0Long, err := d.rd.DecodeBit(&d.isRep0Long[isRep0LongIdx])
+			if isRep0Long == 0 {
+				d.state = updateStateShortRep(d.state)
+				b, err := d.out.getByte(d.rep0)
 				if err != nil {
 					return err
 				}
-				if isRep0Long == 0 {
-					d.state = updateStateShortRep(d.state)
-					b, err := d.out.getByte(d.rep0)
-					if err != nil {
-						return err
-					}
-					if err := d.out.putByte(b); err != nil {
-						return err
-					}
-					d.prev = b
-					d.pos++
-					continue
-				}
-			} else {
-				var dist uint32
-				isRepG1, err := d.rd.DecodeBit(&d.isRepG1Probs[d.state])
-				if err != nil {
-					return err
-				}
-				if isRepG1 == 0 {
-					dist = d.rep1
-				} else {
-					isRepG2, err := d.rd.DecodeBit(&d.isRepG2Probs[d.state])
-					if err != nil {
-						return err
-					}
-					if isRepG2 == 0 {
-						dist = d.rep2
-					} else {
-						dist = d.rep3
-						d.rep3 = d.rep2
-					}
-					d.rep2 = d.rep1
-				}
-				d.rep1 = d.rep0
-				d.rep0 = dist
+				d.out.putByte(b)
+				dst[*written] = b
+				*written = *written + 1
+				d.prev = b
+				d.pos++
+				return nil
 			}
-
-			repLen, err := d.repLenDecoder.decode(d.rd, posState)
-			if err != nil {
-				return err
-			}
-			length = repLen + matchMinLen
-			d.state = updateStateRep(d.state)
 		} else {
-			d.rep3 = d.rep2
-			d.rep2 = d.rep1
-			d.rep1 = d.rep0
-
-			mainLen, err := d.lenDecoder.decode(d.rd, posState)
+			var dist uint32
+			isRepG1, err := d.rd.decodeBit(&d.isRepG1Probs[stateIdx])
 			if err != nil {
 				return err
 			}
-			length = mainLen + matchMinLen
-			d.state = updateStateMatch(d.state)
-
-			lenToPosState := getLenToPosState(length)
-			posSlot, err := decodeBitTree(d.rd, d.posSlotCoder[lenToPosState][:], numPosSlotBits)
-			if err != nil {
-				return err
-			}
-
-			if posSlot < startPosModelIndex {
-				d.rep0 = posSlot
+			if isRepG1 == 0 {
+				dist = d.rep1
 			} else {
-				numDirectBits := int((posSlot >> 1) - 1)
-				d.rep0 = (2 | (posSlot & 1)) << uint(numDirectBits)
-
-				if posSlot < endPosModelIndex {
-					base := int(d.rep0 - posSlot - 1)
-					extra, err := reverseDecodeWithOffset(d.rd, d.posDecoders, base, numDirectBits)
-					if err != nil {
-						return err
-					}
-					d.rep0 += extra
+				isRepG2, err := d.rd.decodeBit(&d.isRepG2Probs[stateIdx])
+				if err != nil {
+					return err
+				}
+				if isRepG2 == 0 {
+					dist = d.rep2
 				} else {
-					direct, err := d.rd.DecodeDirectBits(numDirectBits - numAlignBits)
-					if err != nil {
-						return err
-					}
-					d.rep0 += direct << numAlignBits
-
-					align, err := reverseDecodeBitTree(d.rd, d.posAlign[:], numAlignBits)
-					if err != nil {
-						return err
-					}
-					d.rep0 += align
+					dist = d.rep3
+					d.rep3 = d.rep2
 				}
-
-				if d.rep0 == ^uint32(0) {
-					if !hasKnownSize {
-						return d.out.flush()
-					}
-					return ErrDataAfterEndMarker
-				}
+				d.rep2 = d.rep1
 			}
+			d.rep1 = d.rep0
+			d.rep0 = dist
 		}
 
-		if hasKnownSize && d.pos+int64(length) > hdr.UncompressedSize {
-			return ErrOutputOverrun
-		}
-
-		if err := d.copyMatch(length); err != nil {
+		repLen, err := d.repLenDecoder.decode(d.rd, posState)
+		if err != nil {
 			return err
+		}
+		length = repLen + matchMinLen
+		d.state = updateStateRep(d.state)
+	} else {
+		d.rep3 = d.rep2
+		d.rep2 = d.rep1
+		d.rep1 = d.rep0
+
+		mainLen, err := d.lenDecoder.decode(d.rd, posState)
+		if err != nil {
+			return err
+		}
+		length = mainLen + matchMinLen
+		d.state = updateStateMatch(d.state)
+
+		lenToPosState := getLenToPosState(length)
+		posSlot, err := decodeBitTree(d.rd, d.posSlotCoder[int(lenToPosState)][:], numPosSlotBits)
+		if err != nil {
+			return err
+		}
+
+		if posSlot < startPosModelIndex {
+			d.rep0 = posSlot
+		} else {
+			numDirectBits := (posSlot >> 1) - 1
+			d.rep0 = (2 | (posSlot & 1)) << numDirectBits
+
+			if posSlot < endPosModelIndex {
+				if d.rep0 < posSlot {
+					return fmt.Errorf("invalid distance model offset: rep0=%d posSlot=%d", d.rep0, posSlot)
+				}
+				base := d.rep0 - posSlot
+				extra, err := reverseDecodeWithOffset(d.rd, d.posDecoders, base, numDirectBits)
+				if err != nil {
+					return err
+				}
+				d.rep0 += extra
+			} else {
+				direct, err := d.rd.decodeDirectBits(numDirectBits - numAlignBits)
+				if err != nil {
+					return err
+				}
+				d.rep0 += direct << numAlignBits
+
+				align, err := reverseDecodeBitTree(d.rd, d.posAlign[:], numAlignBits)
+				if err != nil {
+					return err
+				}
+				d.rep0 += align
+			}
+
+			// 0xFFFFFFFF is the end marker for unknown-size streams.
+			if d.rep0 == ^uint32(0) {
+				if !d.hasKnownSize {
+					d.finished = true
+					return io.EOF
+				}
+				return ErrDataAfterEndMarker
+			}
 		}
 	}
+
+	if d.hasKnownSize && d.pos+uint64(length) > d.knownSize {
+		return ErrOutputOverrun
+	}
+
+	if err := d.copyMatchTo(length, dst, written); err != nil {
+		return err
+	}
+
+	return nil
 }
 
-func (d *Decoder) initModels() error {
+// initModels allocates and initializes all probability tables for current properties.
+func (d *decoder) initModels() error {
 	hdr := d.header
-	if hdr.Properties.LC < 0 || hdr.Properties.LC > 8 || hdr.Properties.LP < 0 || hdr.Properties.LP > 4 || hdr.Properties.PB < 0 || hdr.Properties.PB > 4 {
+	if hdr.Properties.LC > 8 || hdr.Properties.LP > 4 || hdr.Properties.PB > 4 {
 		return ErrInvalidProperties
 	}
 
+	propLC := uint32(hdr.Properties.LC)
+	propLP := uint32(hdr.Properties.LP)
+	propPB := uint32(hdr.Properties.PB)
 	posStates := 1 << hdr.Properties.PB
-	d.isMatchProbs = make([]uint16, numStates*posStates)
-	d.isRepProbs = make([]uint16, numStates)
-	d.isRepG0Probs = make([]uint16, numStates)
-	d.isRepG1Probs = make([]uint16, numStates)
-	d.isRepG2Probs = make([]uint16, numStates)
-	d.isRep0Long = make([]uint16, numStates*posStates)
-	d.posDecoders = make([]uint16, numFullDistances-startPosModelIndex)
-
 	literalContexts := 1 << (hdr.Properties.LC + hdr.Properties.LP)
-	d.literalProbs = make([]uint16, literalSize*literalContexts)
+	requiredMatchLen := numStates * posStates
+	requiredLiteralLen := literalSize * literalContexts
+	requiredPosStatesLen := numStates * posStates
+	requiredPosDecodersLen := numFullDistances - startPosModelIndex
+
+	if cap(d.isMatchProbs) < requiredMatchLen {
+		d.isMatchProbs = make([]uint16, requiredMatchLen)
+	} else {
+		d.isMatchProbs = d.isMatchProbs[:requiredMatchLen]
+	}
+
+	if len(d.isRepProbs) != numStates {
+		d.isRepProbs = make([]uint16, numStates)
+	}
+	if len(d.isRepG0Probs) != numStates {
+		d.isRepG0Probs = make([]uint16, numStates)
+	}
+	if len(d.isRepG1Probs) != numStates {
+		d.isRepG1Probs = make([]uint16, numStates)
+	}
+	if len(d.isRepG2Probs) != numStates {
+		d.isRepG2Probs = make([]uint16, numStates)
+	}
+
+	if cap(d.isRep0Long) < requiredPosStatesLen {
+		d.isRep0Long = make([]uint16, requiredPosStatesLen)
+	} else {
+		d.isRep0Long = d.isRep0Long[:requiredPosStatesLen]
+	}
+
+	if cap(d.literalProbs) < requiredLiteralLen {
+		d.literalProbs = make([]uint16, requiredLiteralLen)
+	} else {
+		d.literalProbs = d.literalProbs[:requiredLiteralLen]
+	}
+
+	if len(d.posDecoders) != requiredPosDecodersLen {
+		d.posDecoders = make([]uint16, requiredPosDecodersLen)
+	}
 
 	for i := range d.isMatchProbs {
 		d.isMatchProbs[i] = probInit
@@ -406,6 +446,12 @@ func (d *Decoder) initModels() error {
 		d.posAlign[i] = probInit
 	}
 
+	d.posStateMask = (uint32(1) << propPB) - 1
+	d.pb = propPB
+	d.literalLPMask = (uint32(1) << propLP) - 1
+	d.literalLC = propLC
+	d.literalPrevShift = 8 - propLC
+
 	d.lenDecoder.init()
 	d.repLenDecoder.init()
 
@@ -419,112 +465,167 @@ func (d *Decoder) initModels() error {
 	return nil
 }
 
-func (d *Decoder) currentPosState() int {
-	mask := int64((1 << d.header.Properties.PB) - 1)
-	return int(d.pos & mask)
+// currentPosState returns the masked position state derived from output position.
+func (d *decoder) currentPosState() uint32 {
+	return uint32(d.pos) & d.posStateMask
 }
 
-func (d *Decoder) decodeLiteral() (byte, error) {
-	hdr := d.header
-	lpMask := int64((1 << hdr.Properties.LP) - 1)
-	litCtx := int(((d.pos & lpMask) << hdr.Properties.LC) + int64(int(d.prev)>>uint(8-hdr.Properties.LC)))
-	offset := litCtx * literalSize
+// decodeLiteral decodes a literal byte using plain or matched literal coding.
+func (d *decoder) decodeLiteral() (byte, error) {
+	pos := uint32(d.pos)
+	prev := uint32(d.prev)
+	litCtx := ((pos & d.literalLPMask) << d.literalLC) + (prev >> d.literalPrevShift)
+	probs := d.literalProbs[int(litCtx)*literalSize:]
 
-	symbol := uint32(1)
 	if d.state >= 7 {
 		matchByte, err := d.out.getByte(d.rep0)
 		if err != nil {
 			return 0, err
 		}
-		for symbol < 0x100 {
-			matchBit := (uint32(matchByte) >> 7) & 1
-			matchByte <<= 1
-			index := ((1 + matchBit) << 8) + symbol
-			bit, err := d.rd.DecodeBit(&d.literalProbs[offset+int(index)])
-			if err != nil {
-				return 0, err
-			}
-			symbol = (symbol << 1) | bit
-			if matchBit != bit {
-				for symbol < 0x100 {
-					bit, err := d.rd.DecodeBit(&d.literalProbs[offset+int(symbol)])
-					if err != nil {
-						return 0, err
-					}
-					symbol = (symbol << 1) | bit
-				}
-				break
-			}
+		return d.decodeLiteralMatched(probs, matchByte)
+	}
+
+	return d.decodeLiteralPlain(probs)
+}
+
+// decodeLiteralPlain decodes a literal without match-byte context.
+func (d *decoder) decodeLiteralPlain(probs []uint16) (byte, error) {
+	symbol := uint32(1)
+	for symbol < 0x100 {
+		bit, err := d.rd.decodeBit(&probs[int(symbol)])
+		if err != nil {
+			return 0, err
 		}
-	} else {
-		for symbol < 0x100 {
-			bit, err := d.rd.DecodeBit(&d.literalProbs[offset+int(symbol)])
-			if err != nil {
-				return 0, err
-			}
-			symbol = (symbol << 1) | bit
+		symbol = (symbol << 1) | bit
+	}
+	return byte(symbol - 0x100), nil
+}
+
+// decodeLiteralMatched decodes a literal with match-byte guided probability selection.
+func (d *decoder) decodeLiteralMatched(probs []uint16, matchByte byte) (byte, error) {
+	symbol := uint32(1)
+	mb := uint32(matchByte)
+	for symbol < 0x100 {
+		matchBit := (mb >> 7) & 1
+		mb <<= 1
+		idx := ((1 + matchBit) << 8) | symbol
+		bit, err := d.rd.decodeBit(&probs[int(idx)])
+		if err != nil {
+			return 0, err
 		}
+		symbol = (symbol << 1) | bit
+		if matchBit != bit {
+			break
+		}
+	}
+
+	for symbol < 0x100 {
+		bit, err := d.rd.decodeBit(&probs[int(symbol)])
+		if err != nil {
+			return 0, err
+		}
+		symbol = (symbol << 1) | bit
 	}
 
 	return byte(symbol - 0x100), nil
 }
 
-func (d *Decoder) copyMatch(length uint32) error {
-	for i := uint32(0); i < length; i++ {
-		b, err := d.out.getByte(d.rep0)
-		if err != nil {
+// copyMatchTo copies a decoded match into dictionary and optional output buffer.
+func (d *decoder) copyMatchTo(length uint32, dst []byte, written *int) error {
+	if written == nil {
+		if err := d.out.copyFrom(d.rep0, length); err != nil {
 			return err
 		}
-		if err := d.out.putByte(b); err != nil {
-			return err
+		d.pos += uint64(length)
+		if b, err := d.out.getByte(0); err == nil {
+			d.prev = b
 		}
-		d.prev = b
-		d.pos++
+		d.pendingMatchLen = 0
+		return nil
 	}
+
+	// If dst is full, remaining bytes are emitted by emitPendingMatch on next Read call.
+	produced, err := d.out.copyFromToDst(d.rep0, length, dst[*written:])
+	if err != nil {
+		return err
+	}
+	*written += int(produced)
+	d.pos += uint64(produced)
+	if produced > 0 {
+		if b, err := d.out.getByte(0); err == nil {
+			d.prev = b
+		}
+	}
+	d.pendingMatchLen = length - produced
 	return nil
 }
 
-func decodeBitTree(rd *RangeDecoder, probs []uint16, numBits int) (uint32, error) {
+// emitPendingMatch flushes remaining match bytes from previous partial copy.
+func (d *decoder) emitPendingMatch(dst []byte, written *int) error {
+	if d.pendingMatchLen == 0 {
+		return nil
+	}
+
+	produced, err := d.out.copyFromToDst(d.rep0, d.pendingMatchLen, dst[*written:])
+	if err != nil {
+		return err
+	}
+	*written += int(produced)
+	d.pos += uint64(produced)
+	if produced > 0 {
+		if b, err := d.out.getByte(0); err == nil {
+			d.prev = b
+		}
+	}
+	d.pendingMatchLen -= produced
+	return nil
+}
+
+// decodeBitTree decodes a forward bit-tree symbol.
+func decodeBitTree(rd *rangeDecoder, probs []uint16, numBits uint32) (uint32, error) {
 	m := uint32(1)
-	for i := 0; i < numBits; i++ {
-		bit, err := rd.DecodeBit(&probs[m])
+	for range numBits {
+		bit, err := rd.decodeBit(&probs[int(m)])
 		if err != nil {
 			return 0, err
 		}
 		m = (m << 1) | bit
 	}
-	return m - (1 << uint(numBits)), nil
+	return m - (uint32(1) << numBits), nil
 }
 
-func reverseDecodeBitTree(rd *RangeDecoder, probs []uint16, numBits int) (uint32, error) {
+// reverseDecodeBitTree decodes a reverse bit-tree symbol.
+func reverseDecodeBitTree(rd *rangeDecoder, probs []uint16, numBits uint32) (uint32, error) {
 	var symbol uint32
 	m := uint32(1)
-	for i := 0; i < numBits; i++ {
-		bit, err := rd.DecodeBit(&probs[m])
+	for i := range numBits {
+		bit, err := rd.decodeBit(&probs[int(m)])
 		if err != nil {
 			return 0, err
 		}
 		m = (m << 1) | bit
-		symbol |= bit << uint(i)
+		symbol |= bit << i
 	}
 	return symbol, nil
 }
 
-func reverseDecodeWithOffset(rd *RangeDecoder, probs []uint16, offset, numBits int) (uint32, error) {
+// reverseDecodeWithOffset decodes a reverse bit-tree symbol from probs[offset:].
+func reverseDecodeWithOffset(rd *rangeDecoder, probs []uint16, offset, numBits uint32) (uint32, error) {
 	var symbol uint32
 	m := uint32(1)
-	for i := 0; i < numBits; i++ {
-		bit, err := rd.DecodeBit(&probs[offset+int(m)])
+	for i := range numBits {
+		bit, err := rd.decodeBit(&probs[int(offset+m)])
 		if err != nil {
 			return 0, err
 		}
 		m = (m << 1) | bit
-		symbol |= bit << uint(i)
+		symbol |= bit << i
 	}
 	return symbol, nil
 }
 
-func updateStateLiteral(state int) int {
+// updateStateLiteral applies the LZMA state transition after a literal.
+func updateStateLiteral(state uint32) uint32 {
 	if state < 4 {
 		return 0
 	}
@@ -534,31 +635,35 @@ func updateStateLiteral(state int) int {
 	return state - 6
 }
 
-func updateStateMatch(state int) int {
+// updateStateMatch applies the LZMA state transition after a new match.
+func updateStateMatch(state uint32) uint32 {
 	if state < 7 {
 		return 7
 	}
 	return 10
 }
 
-func updateStateRep(state int) int {
+// updateStateRep applies the LZMA state transition after a repeated match.
+func updateStateRep(state uint32) uint32 {
 	if state < 7 {
 		return 8
 	}
 	return 11
 }
 
-func updateStateShortRep(state int) int {
+// updateStateShortRep applies the LZMA state transition after a short rep.
+func updateStateShortRep(state uint32) uint32 {
 	if state < 7 {
 		return 9
 	}
 	return 11
 }
 
-func getLenToPosState(length uint32) int {
+// getLenToPosState maps match length to the distance-slot state.
+func getLenToPosState(length uint32) uint32 {
 	length -= matchMinLen
-	if length < numLenToPosStates {
-		return int(length)
+	if length < uint32(numLenToPosStates) {
+		return length
 	}
-	return numLenToPosStates - 1
+	return uint32(numLenToPosStates - 1)
 }

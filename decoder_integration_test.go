@@ -3,62 +3,57 @@ package lzma
 import (
 	"bytes"
 	"encoding/binary"
+	"io"
 	"testing"
-
-	reflzma "github.com/ulikunitz/xz/lzma"
 )
 
-func compressWithReferenceLZMA(tb testing.TB, src []byte) []byte {
-	tb.Helper()
+func TestDecodeRandomCompressedSampleKnownSizeHash(t *testing.T) {
+	src := randomBytes(t, 2026030101, 2*1024*1024)
+	compressed := compressWithReferenceLZMA(t, src, true)
 
-	var buf bytes.Buffer
-	w, err := reflzma.NewWriter(&buf)
+	r, err := NewReader(bytes.NewReader(compressed))
 	if err != nil {
-		tb.Fatalf("reference lzma.NewWriter failed: %v", err)
+		t.Fatalf("NewReader failed: %v", err)
 	}
-	if _, err := w.Write(src); err != nil {
-		tb.Fatalf("reference writer write failed: %v", err)
+	defer r.Close()
+
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("decode random known-size sample failed: %v", err)
 	}
-	if err := w.Close(); err != nil {
-		tb.Fatalf("reference writer close failed: %v", err)
+
+	if len(out) != len(src) {
+		t.Fatalf("decoded size mismatch: got %d want %d", len(out), len(src))
 	}
-	return buf.Bytes()
+	if got, want := sha256Hex(out), sha256Hex(src); got != want {
+		t.Fatalf("decoded hash mismatch: got %s want %s", got, want)
+	}
 }
 
-func TestDecodeLZMARoundTripUnknownSize(t *testing.T) {
-	src := bytes.Repeat([]byte("abcabcXYZ123"), 64)
-	compressed := compressWithReferenceLZMA(t, src)
+func TestDecodeRandomCompressedSampleUnknownSizeHash(t *testing.T) {
+	src := randomBytes(t, 2026030102, 1024*1024)
+	compressed := compressWithReferenceLZMA(t, src, false)
 
-	if len(compressed) < LZMAHeaderSize+5 {
+	if len(compressed) < lzmaHeaderSize+5 {
 		t.Fatalf("compressed stream too short: %d", len(compressed))
 	}
 	binary.LittleEndian.PutUint64(compressed[5:13], ^uint64(0))
 
-	dec := NewDecoder()
-	var out bytes.Buffer
-	if err := dec.DecodeLZMA(bytes.NewReader(compressed), &out); err != nil {
-		t.Fatalf("DecodeLZMA unknown-size failed: %v", err)
+	r, err := NewReader(bytes.NewReader(compressed))
+	if err != nil {
+		t.Fatalf("NewReader failed: %v", err)
 	}
-	if !bytes.Equal(out.Bytes(), src) {
-		t.Fatalf("unknown-size decode mismatch: got %d bytes, want %d", out.Len(), len(src))
-	}
-}
+	defer r.Close()
 
-func TestDecodeLZMARoundTripKnownSize(t *testing.T) {
-	src := bytes.Repeat([]byte("The quick brown fox jumps over the lazy dog."), 48)
-	compressed := compressWithReferenceLZMA(t, src)
-
-	if len(compressed) < LZMAHeaderSize+5 {
-		t.Fatalf("compressed stream too short: %d", len(compressed))
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("decode random unknown-size sample failed: %v", err)
 	}
-	binary.LittleEndian.PutUint64(compressed[5:13], uint64(len(src)))
 
-	dec := NewDecoder()
-	var out bytes.Buffer
-	if err := dec.DecodeLZMA(bytes.NewReader(compressed), &out); err != nil {
-		t.Fatalf("DecodeLZMA known-size failed: %v", err)
+	if len(out) != len(src) {
+		t.Fatalf("decoded size mismatch: got %d want %d", len(out), len(src))
 	}
-	if !bytes.Equal(out.Bytes(), src) {
-		t.Fatalf("known-size decode mismatch: got %d bytes, want %d", out.Len(), len(src))
+	if got, want := sha256Hex(out), sha256Hex(src); got != want {
+		t.Fatalf("decoded hash mismatch: got %s want %s", got, want)
 	}
 }
