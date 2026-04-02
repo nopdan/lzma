@@ -54,6 +54,8 @@ func main() {
 
 ## Public API
 
+- `HeaderSize`
+- `ValidHeader(b []byte) bool`
 - `NewReader(r io.Reader) (*Reader, error)`
 - `(*Reader).Read(p []byte) (int, error)`
 - `(*Reader).Close() error`
@@ -92,6 +94,7 @@ In this repository, these test/benchmark-only dependencies are:
 ## Caveats
 
 - Input must be raw `.lzma` stream, not `.xz`.
+- `ValidHeader` validates only the 13-byte `.lzma` header, not the full payload.
 - Call `Close()` to release pooled resources early.
 - Benchmark input file is configured by `benchmarkFilePath` in `decoder_benchmark_test.go`.
   Default: `333_53119_SRJ.lzma` in project root.

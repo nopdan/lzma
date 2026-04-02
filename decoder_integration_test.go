@@ -34,7 +34,7 @@ func TestDecodeRandomCompressedSampleUnknownSizeHash(t *testing.T) {
 	src := randomBytes(t, 2026030102, 1024*1024)
 	compressed := compressWithReferenceLZMA(t, src, false)
 
-	if len(compressed) < lzmaHeaderSize+5 {
+	if len(compressed) < HeaderSize+5 {
 		t.Fatalf("compressed stream too short: %d", len(compressed))
 	}
 	binary.LittleEndian.PutUint64(compressed[5:13], ^uint64(0))

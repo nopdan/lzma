@@ -8,6 +8,12 @@ import (
 	"testing"
 )
 
+func TestHeaderSize(t *testing.T) {
+	if HeaderSize != 13 {
+		t.Fatalf("HeaderSize = %d, want %d", HeaderSize, 13)
+	}
+}
+
 func TestParseProperties(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -53,7 +59,7 @@ func TestParseProperties(t *testing.T) {
 }
 
 func TestParseLZMAHeader(t *testing.T) {
-	var raw [lzmaHeaderSize]byte
+	var raw [HeaderSize]byte
 	raw[0] = 0x5d
 	binary.LittleEndian.PutUint32(raw[1:5], 0)
 	binary.LittleEndian.PutUint64(raw[5:13], 12345)
@@ -77,7 +83,7 @@ func TestParseLZMAHeader(t *testing.T) {
 }
 
 func TestReadLZMAHeaderUnknownSize(t *testing.T) {
-	var raw [lzmaHeaderSize]byte
+	var raw [HeaderSize]byte
 	raw[0] = 0x5d
 	binary.LittleEndian.PutUint32(raw[1:5], 4096)
 	binary.LittleEndian.PutUint64(raw[5:13], ^uint64(0))
@@ -106,5 +112,26 @@ func TestReadLZMAHeaderReadError(t *testing.T) {
 	_, err := readLZMAHeader(reader)
 	if !errors.Is(err, ErrInvalidHeader) {
 		t.Fatalf("readLZMAHeader limited reader error = %v, want %v", err, ErrInvalidHeader)
+	}
+}
+
+func TestValidHeader(t *testing.T) {
+	valid := make([]byte, HeaderSize)
+	valid[0] = 0x5d
+	binary.LittleEndian.PutUint32(valid[1:5], 1<<20)
+	binary.LittleEndian.PutUint64(valid[5:13], 123)
+
+	if !ValidHeader(valid) {
+		t.Fatalf("ValidHeader(valid) = false, want true")
+	}
+
+	if ValidHeader(valid[:HeaderSize-1]) {
+		t.Fatalf("ValidHeader(short) = true, want false")
+	}
+
+	invalid := append([]byte(nil), valid...)
+	invalid[0] = 225
+	if ValidHeader(invalid) {
+		t.Fatalf("ValidHeader(invalid) = true, want false")
 	}
 }

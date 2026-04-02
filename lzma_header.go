@@ -7,8 +7,8 @@ import (
 	"io"
 )
 
-// lzmaHeaderSize is the size in bytes of the legacy .lzma stream header.
-const lzmaHeaderSize = 13
+// HeaderSize is the size in bytes of the legacy .lzma stream header.
+const HeaderSize = 13
 
 // properties stores lc/lp/pb fields encoded in the first header byte.
 type properties struct {
@@ -51,7 +51,7 @@ func parseProperties(b byte) (properties, error) {
 }
 
 // parseLZMAHeader parses a 13-byte .lzma header into structured metadata.
-func parseLZMAHeader(raw [lzmaHeaderSize]byte) (header, error) {
+func parseLZMAHeader(raw [HeaderSize]byte) (header, error) {
 	props, err := parseProperties(raw[0])
 	if err != nil {
 		return header{}, err
@@ -78,7 +78,7 @@ func parseLZMAHeader(raw [lzmaHeaderSize]byte) (header, error) {
 
 // readLZMAHeader reads and parses a full .lzma header from r.
 func readLZMAHeader(r io.Reader) (header, error) {
-	var raw [lzmaHeaderSize]byte
+	var raw [HeaderSize]byte
 	if _, err := io.ReadFull(r, raw[:]); err != nil {
 		if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
 			return header{}, fmt.Errorf("%w: short header", ErrInvalidHeader)
@@ -86,4 +86,19 @@ func readLZMAHeader(r io.Reader) (header, error) {
 		return header{}, err
 	}
 	return parseLZMAHeader(raw)
+}
+
+// ValidHeader reports whether b starts with a syntactically valid .lzma header.
+//
+// It checks only the 13-byte legacy .lzma header and does not validate that the
+// remaining payload can be fully decoded.
+func ValidHeader(b []byte) bool {
+	if len(b) < HeaderSize {
+		return false
+	}
+
+	var raw [HeaderSize]byte
+	copy(raw[:], b[:HeaderSize])
+	_, err := parseLZMAHeader(raw)
+	return err == nil
 }

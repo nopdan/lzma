@@ -11,7 +11,7 @@ import (
 func TestDecodeLZMALiteralOnlyZeros(t *testing.T) {
 	var stream bytes.Buffer
 
-	var hdr [lzmaHeaderSize]byte
+	var hdr [HeaderSize]byte
 	hdr[0] = 0x5d
 	binary.LittleEndian.PutUint32(hdr[1:5], 1<<20)
 	binary.LittleEndian.PutUint64(hdr[5:13], 4)
@@ -44,7 +44,7 @@ func TestDecodeLZMALiteralOnlyZeros(t *testing.T) {
 func TestDecodeLZMAZeroSizeReturnsEOF(t *testing.T) {
 	var stream bytes.Buffer
 
-	var hdr [lzmaHeaderSize]byte
+	var hdr [HeaderSize]byte
 	hdr[0] = 0x5d
 	binary.LittleEndian.PutUint32(hdr[1:5], 4096)
 	binary.LittleEndian.PutUint64(hdr[5:13], 0)
@@ -67,7 +67,7 @@ func TestDecodeLZMAZeroSizeReturnsEOF(t *testing.T) {
 func TestDecodeLZMAUnknownSizePath(t *testing.T) {
 	var stream bytes.Buffer
 
-	var hdr [lzmaHeaderSize]byte
+	var hdr [HeaderSize]byte
 	hdr[0] = 0x5d
 	binary.LittleEndian.PutUint32(hdr[1:5], 4096)
 	binary.LittleEndian.PutUint64(hdr[5:13], ^uint64(0))
@@ -87,7 +87,7 @@ func TestDecodeLZMAUnknownSizePath(t *testing.T) {
 }
 
 func TestDecodeLZMAInvalidPropertiesHeader(t *testing.T) {
-	var raw [lzmaHeaderSize]byte
+	var raw [HeaderSize]byte
 	raw[0] = 0xFF
 	binary.LittleEndian.PutUint32(raw[1:5], 4096)
 	binary.LittleEndian.PutUint64(raw[5:13], 10)

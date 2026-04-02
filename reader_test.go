@@ -9,7 +9,7 @@ import (
 
 func TestNewReaderZeroSizeImmediateEOF(t *testing.T) {
 	var stream bytes.Buffer
-	var hdr [lzmaHeaderSize]byte
+	var hdr [HeaderSize]byte
 	hdr[0] = 0x5d
 	binary.LittleEndian.PutUint32(hdr[1:5], 1<<20)
 	binary.LittleEndian.PutUint64(hdr[5:13], 0)
@@ -31,7 +31,7 @@ func TestNewReaderZeroSizeImmediateEOF(t *testing.T) {
 
 func TestReaderCloseIdempotent(t *testing.T) {
 	var stream bytes.Buffer
-	var hdr [lzmaHeaderSize]byte
+	var hdr [HeaderSize]byte
 	hdr[0] = 0x5d
 	binary.LittleEndian.PutUint32(hdr[1:5], 1<<20)
 	binary.LittleEndian.PutUint64(hdr[5:13], 0)

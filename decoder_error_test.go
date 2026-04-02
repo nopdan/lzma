@@ -10,7 +10,7 @@ import (
 
 func TestDecodeLZMARejectsInvalidRangeHeader(t *testing.T) {
 	var stream bytes.Buffer
-	var hdr [lzmaHeaderSize]byte
+	var hdr [HeaderSize]byte
 	hdr[0] = 0x5d
 	binary.LittleEndian.PutUint32(hdr[1:5], 1<<20)
 	binary.LittleEndian.PutUint64(hdr[5:13], 1)

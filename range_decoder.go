@@ -92,17 +92,17 @@ func (rd *rangeDecoder) readByte() (byte, error) {
 }
 
 // normalize keeps rng above top threshold by shifting in source bytes.
-func (rd *rangeDecoder) normalize() error {
-	for rd.rng < rangeTopValue {
-		b, err := rd.readByte()
-		if err != nil {
-			return err
-		}
-		rd.code = (rd.code << 8) | uint32(b)
-		rd.rng <<= 8
-	}
-	return nil
-}
+// func (rd *rangeDecoder) normalize() error {
+// 	for rd.rng < rangeTopValue {
+// 		b, err := rd.readByte()
+// 		if err != nil {
+// 			return err
+// 		}
+// 		rd.code = (rd.code << 8) | uint32(b)
+// 		rd.rng <<= 8
+// 	}
+// 	return nil
+// }
 
 // decodeBit decodes one bit using the adaptive probability model.
 func (rd *rangeDecoder) decodeBit(prob *uint16) (uint32, error) {
